@@ -1,5 +1,6 @@
 x-airflow-common: &airflow-common
   image: apache/airflow:3.0.1
+  user: "0:0"
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
