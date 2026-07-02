@@ -8,54 +8,32 @@ from typing import Any
 
 from rdkit import Chem
 
-from .repository import TaskRepository
-from .utils import download_file_from_s3, file_exists_in_s3, upload_file_to_s3
+from .utils import download_file_from_s3, upload_file_to_s3
 
 logger = logging.getLogger(__name__)
 
 
 class MoleculeGenerationService:
-    MAX_MOLECULES_DEFAULT = 50_000
+    MAX_MOLECULES_PER_SCAFFOLD_DEFAULT = 50_000
 
-    def __init__(self, task, repo: TaskRepository, session) -> None:
-        self._task = task
-        self._repo = repo
-        self._session = session
-        self._scaffold = self._task.params["scaffold"]
-        self._max_molecules = int(self._task.params.get("max_molecules", self.MAX_MOLECULES_DEFAULT))
-        self._r_groups = None
+    def __init__(self, dataset_id: str, max_molecules_per_scaffold: int | None = None) -> None:
+        self._dataset_id = dataset_id
+        self._scaffolds_key = f"inputs/{dataset_id}_scaffolds.csv"
+        self._r_groups_key = f"inputs/{dataset_id}_r_groups.csv"
+        self._output_key = f"outputs/{dataset_id}/molecules.csv"
+        self._max_molecules = max_molecules_per_scaffold or self.MAX_MOLECULES_PER_SCAFFOLD_DEFAULT
 
-    def _validate_params(self) -> None:
-        params = self._task.params
-
-        if not params.get("scaffold"):
-            raise ValueError("scaffold is required.")
-        if not params.get("r_groups_artifact_id"):
-            raise ValueError("r_groups_artifact_id is required.")
-
-        try:
-            scaffold_mol = Chem.MolFromSmiles(params["scaffold"])
-        except Exception:
-            scaffold_mol = None
-
-        if not scaffold_mol:
-            raise ValueError(f"Invalid scaffold: {params['scaffold']!r}")
-
-        attachment_points = [a for a in scaffold_mol.GetAtoms() if a.GetAtomicNum() == 0]
-        if not attachment_points:
-            raise ValueError(
-                "Scaffold contains no [*] attachment points. "
-                "Use [*] to mark substitution positions."
-            )
-
-        artifact = self._repo.get_artifact_by_id(params["r_groups_artifact_id"])
-        if not file_exists_in_s3(artifact.s3_key):
-            raise ValueError(f"R-Groups file not found in S3: {artifact.s3_key}")
+    def _load_scaffolds(self) -> list[str]:
+        raw = download_file_from_s3(self._scaffolds_key)
+        scaffolds = [
+            line.strip() for line in raw.decode("utf-8").strip().splitlines()[1:] if line.strip()
+        ]
+        if not scaffolds:
+            raise ValueError(f"No scaffolds found in {self._scaffolds_key}")
+        return scaffolds
 
     def _load_r_groups(self) -> dict[str, list[str]]:
-        artifact = self._repo.get_artifact_by_id(self._task.params["r_groups_artifact_id"])
-        raw = download_file_from_s3(artifact.s3_key)
-
+        raw = download_file_from_s3(self._r_groups_key)
         reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
         result: dict[str, list[str]] = {col: [] for col in (reader.fieldnames or [])}
         skipped_count = 0
@@ -71,25 +49,39 @@ class MoleculeGenerationService:
             logger.warning(f"Skipped {skipped_count} invalid rows during R-group parsing")
 
         logger.info(f"Loaded R-groups: { {k: len(v) for k, v in result.items()} }")
-        self._r_groups = result
+        return result
 
-    def _generate(self) -> tuple[list[dict[str, Any]], dict]:
-        scaffold_mol = Chem.MolFromSmiles(self._scaffold)
-        ordered_labels = sorted(self._r_groups.keys())
+    def _generate_for_scaffold(
+        self, scaffold_smiles: str, r_groups: dict[str, list[str]]
+    ) -> tuple[list[dict[str, Any]], dict]:
+        scaffold_mol = Chem.MolFromSmiles(scaffold_smiles)
+        if scaffold_mol is None:
+            raise ValueError(f"Invalid scaffold: {scaffold_smiles!r}")
+
         attachment_points = [a for a in scaffold_mol.GetAtoms() if a.GetAtomicNum() == 0]
+        if not attachment_points:
+            raise ValueError(
+                f"Scaffold {scaffold_smiles!r} has no [*] attachment points. "
+                "Use [*] to mark substitution positions."
+            )
 
+        ordered_labels = sorted(r_groups.keys())
         if len(attachment_points) != len(ordered_labels):
             raise ValueError(
-                f"Scaffold has {len(attachment_points)} attachment point(s) but "
-                f"{len(ordered_labels)} R-group(s) were provided: {ordered_labels}."
+                f"Scaffold {scaffold_smiles!r} has {len(attachment_points)} attachment "
+                f"point(s) but {len(ordered_labels)} R-group column(s) were provided: "
+                f"{ordered_labels}."
             )
 
         rows: list[dict[str, Any]] = []
         total_attempted = skipped_invalid = 0
 
-        for combo in itertools.product(*[self._r_groups[lbl] for lbl in ordered_labels]):
+        for combo in itertools.product(*[r_groups[lbl] for lbl in ordered_labels]):
             if total_attempted >= self._max_molecules:
-                logger.warning(f"Reached max_molecules cap ({self._max_molecules}). Stopping early.")
+                logger.warning(
+                    f"Reached max_molecules_per_scaffold cap ({self._max_molecules}) "
+                    f"for scaffold {scaffold_smiles!r}. Stopping early."
+                )
                 break
             total_attempted += 1
 
@@ -107,51 +99,52 @@ class MoleculeGenerationService:
                 skipped_invalid += 1
                 continue
 
-            row: dict[str, Any] = {"smiles": Chem.MolToSmiles(prod)}
+            row: dict[str, Any] = {
+                "scaffold": scaffold_smiles,
+                "smiles": Chem.MolToSmiles(prod),
+            }
             for label, smi in zip(ordered_labels, combo, strict=True):
                 row[label] = smi
             rows.append(row)
 
-        logger.info(
-            f"Generation complete: "
-            f"- attempted={total_attempted} "
-            f"- valid={len(rows)} "
-            f"- skipped={skipped_invalid}"
-        )
-        return rows, {
+        stats = {
             "total_attempted": total_attempted,
             "total_valid": len(rows),
             "skipped_invalid": skipped_invalid,
         }
+        logger.info(f"Generation complete for scaffold {scaffold_smiles!r}: {stats}")
+        return rows, stats
 
-    def _upload_results(self, rows: list[dict], stats: dict) -> None:
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-        csv_bytes = buf.getvalue().encode("utf-8")
+    def run(self) -> dict:
+        scaffolds = self._load_scaffolds()
+        r_groups = self._load_r_groups()
 
-        csv_key = f"tasks/{self._task.id}/artifacts/molecules.csv"
-        upload_file_to_s3(csv_bytes, csv_key, content_type="text/csv")
-        self._repo.save_molecules_file(
-            task=self._task,
-            s3_key=csv_key,
-            filename="molecules.csv",
-            content_type="text/csv",
-            meta={
-                "total_generated": stats["total_valid"],
-            },
-        )
+        all_rows: list[dict[str, Any]] = []
+        totals = {"total_attempted": 0, "total_valid": 0, "skipped_invalid": 0}
 
-    def run(self) -> None:
-        self._validate_params()
-        self._load_r_groups()
-        rows, stats = self._generate()
+        for scaffold_smiles in scaffolds:
+            rows, stats = self._generate_for_scaffold(scaffold_smiles, r_groups)
+            all_rows.extend(rows)
+            for key in totals:
+                totals[key] += stats[key]
 
-        if not rows:
+        if not all_rows:
             raise ValueError(
-                "Generation produced 0 valid molecules. Check scaffold and R-groups."
+                f"Generation produced 0 valid molecules across {len(scaffolds)} "
+                f"scaffold(s) for dataset '{self._dataset_id}'."
             )
 
-        self._upload_results(rows, stats)
-        self._session.flush()
+        fieldnames = ["scaffold", "smiles"] + sorted(r_groups.keys())
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+        csv_bytes = buf.getvalue().encode("utf-8")
+
+        upload_file_to_s3(csv_bytes, self._output_key, content_type="text/csv")
+
+        logger.info(
+            f"Dataset '{self._dataset_id}': {len(scaffolds)} scaffold(s) -> "
+            f"{totals['total_valid']} total molecules -> {self._output_key}"
+        )
+        return {**totals, "scaffolds_processed": len(scaffolds), "output_key": self._output_key}
