@@ -41,3 +41,7 @@ services:
 
 volumes:
   minio_data:
+
+networks:
+  default:
+    name: pipeline_infra

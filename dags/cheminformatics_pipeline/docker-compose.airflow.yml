@@ -86,6 +86,5 @@ volumes:
 
 networks:
   infra:
-    name: local_deployment_default
+    name: pipeline_infra
     external: true
-  

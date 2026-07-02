@@ -151,7 +151,7 @@ def _run_worker(stage: str, dataset_id: str) -> None:
     result = subprocess.run(
         [
             "docker", "run", "--rm",
-            "--network", "local_deployment_default",
+            "--network", "pipeline_infra",
             "-e", f"S3_ENDPOINT_URL={os.environ['S3_ENDPOINT_URL']}",
             "-e", f"S3_ACCESS_KEY={os.environ['S3_ACCESS_KEY']}",
             "-e", f"S3_SECRET_KEY={os.environ['S3_SECRET_KEY']}",
