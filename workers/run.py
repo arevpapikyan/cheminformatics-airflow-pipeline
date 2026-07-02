@@ -5,6 +5,7 @@ import sys
 from dotenv import load_dotenv
 
 from gen.decorators import timer
+from gen.molecules_clustering_service import MoleculesClusteringService
 from gen.molecules_generation_service import MoleculeGenerationService
 from gen.properties_calculation_service import PropertiesCalculationService
 
@@ -23,6 +24,11 @@ def run_properties(dataset_id: str) -> None:
     PropertiesCalculationService(dataset_id).run()
 
 
+@timer
+def run_cluster(dataset_id: str, n_clusters: int | None) -> None:
+    MoleculesClusteringService(dataset_id, n_clusters=n_clusters).run()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a cheminformatics pipeline stage.")
     subparsers = parser.add_subparsers(dest="stage", required=True)
@@ -37,6 +43,17 @@ def main() -> None:
     )
     properties_parser.add_argument("--dataset-id", required=True)
 
+    cluster_parser = subparsers.add_parser(
+        "cluster", help="Cluster a dataset's generated molecules with K-means."
+    )
+    cluster_parser.add_argument("--dataset-id", required=True)
+    cluster_parser.add_argument(
+        "--n-clusters",
+        type=int,
+        default=None,
+        help="Optional. If omitted, k is chosen automatically via a sqrt(n/2) heuristic.",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -44,6 +61,8 @@ def main() -> None:
             run_generate(args.dataset_id)
         elif args.stage == "properties":
             run_properties(args.dataset_id)
+        elif args.stage == "cluster":
+            run_cluster(args.dataset_id, args.n_clusters)
     except Exception as e:
         logging.exception(e)
         raise
