@@ -18,7 +18,6 @@ x-airflow-common: &airflow-common
     TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL}
   volumes:
     - ../../dags:/opt/airflow/dags:ro
-    - ../../tasks:/opt/airflow/tasks:ro
     - airflow_home:/opt/airflow
     - /var/run/docker.sock:/var/run/docker.sock
   networks:
@@ -89,3 +88,4 @@ networks:
   infra:
     name: local_deployment_default
     external: true
+  
