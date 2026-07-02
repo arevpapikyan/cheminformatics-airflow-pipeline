@@ -404,7 +404,7 @@ def run_molecule_generation(**context) -> None:
         )
 
 
-def quality_checks(**context) -> None:
+def quality_checks_molecules(**context) -> None:
     """
     Post-generation quality checks on each molecules.csv output:
     - File exists in S3
@@ -474,8 +474,194 @@ def quality_checks(**context) -> None:
         )
 
 
+def create_properties_calculation_tasks(**context) -> None:
+    """
+    For each MOLECULE_GENERATION task, looks up the molecules.csv artifact
+    that the generation worker already saved (via repo.save_molecules_file
+    inside its own transaction — see gen/services.py in the worker) and
+    creates one PROPERTIES_CALCULATION task per generation task, referencing
+    that artifact via molecules_artifact_id.
+
+    Unlike molecule generation, no separate "register artifacts" step is
+    needed here: the molecules.csv artifact already exists (its owning task
+    — the generation task — already exists too), so there's no NOT NULL
+    ordering constraint to work around.
+    """
+    molecule_tasks: list = context["ti"].xcom_pull(
+        task_ids="create_molecule_generation_tasks", key="molecule_tasks"
+    ) or []
+
+    if not molecule_tasks:
+        logger.info("No generation tasks to create properties_calculation tasks for — skipping.")
+        context["ti"].xcom_push(key="properties_tasks", value=[])
+        return
+
+    properties_tasks = []
+    session = _get_session()
+    try:
+        for entry in molecule_tasks:
+            gen_task_id = entry["task_id"]
+            dataset_id = entry["dataset_id"]
+
+            artifact_row = session.execute(
+                text(
+                    "SELECT id FROM artifacts "
+                    "WHERE task_id = :task_id AND filename = 'molecules.csv' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"task_id": gen_task_id},
+            ).first()
+
+            if artifact_row is None:
+                raise ValueError(
+                    f"No molecules.csv artifact found for generation task {gen_task_id} "
+                    f"(dataset '{dataset_id}') — cannot create properties_calculation task."
+                )
+            molecules_artifact_id = artifact_row[0]
+
+            prop_task_id = str(uuid.uuid4())
+            params = json.dumps({
+                "molecules_artifact_id": molecules_artifact_id,
+                "dataset_id": dataset_id,
+            })
+            session.execute(
+                text(
+                    "INSERT INTO tasks (id, task_type, status, params, experiment_id, created_by) "
+                    "SELECT :id, :task_type, :status, CAST(:params AS jsonb), experiment_id, :created_by "
+                    "FROM tasks WHERE id = :gen_task_id"
+                ),
+                {
+                    "id": prop_task_id,
+                    "task_type": "PROPERTIES_CALCULATION",
+                    "status": "created",
+                    "params": params,
+                    "created_by": DEFAULT_USER_ID,
+                    "gen_task_id": gen_task_id,
+                },
+            )
+            properties_tasks.append({
+                "task_id": prop_task_id,
+                "dataset_id": dataset_id,
+                "gen_task_id": gen_task_id,
+            })
+
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+    logger.info("Created %d PROPERTIES_CALCULATION tasks", len(properties_tasks))
+    context["ti"].xcom_push(key="properties_tasks", value=properties_tasks)
+
+
+def run_properties_calculation(**context) -> None:
+    properties_tasks: list = context["ti"].xcom_pull(
+        task_ids="create_properties_calculation_tasks", key="properties_tasks"
+    ) or []
+
+    if not properties_tasks:
+        logger.info("No properties_calculation tasks to run — skipping.")
+        return
+
+    for entry in properties_tasks:
+        task_id = entry["task_id"]
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "--network", "local_deployment_default",
+                "-e", f"DATABASE_URL={os.environ['DATABASE_URL']}",
+                "-e", f"S3_ENDPOINT_URL={os.environ['S3_ENDPOINT_URL']}",
+                "-e", f"S3_ACCESS_KEY={os.environ['S3_ACCESS_KEY']}",
+                "-e", f"S3_SECRET_KEY={os.environ['S3_SECRET_KEY']}",
+                "-e", f"S3_BUCKET={os.environ['S3_BUCKET']}",
+                "-e", f"S3_REGION={os.environ.get('S3_REGION', 'us-east-1')}",
+                "properties_calculation",
+                "python", "run.py", "--task-id", task_id,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"properties_calculation worker failed for task {task_id} "
+                f"(dataset '{entry['dataset_id']}'):\n{result.stderr}"
+            )
+
+        logger.info(
+            "properties_calculation worker completed for task %s (dataset '%s')",
+            task_id,
+            entry["dataset_id"],
+        )
+
+
+def quality_checks_properties(**context) -> None:
+    """
+    Post-calculation quality checks on each properties.csv output:
+    - File exists in S3
+    - File is non-empty
+    - CSV has the expected property columns
+    - At least one row of results
+    """
+    properties_tasks: list = context["ti"].xcom_pull(
+        task_ids="create_properties_calculation_tasks", key="properties_tasks"
+    ) or []
+
+    if not properties_tasks:
+        logger.info("No properties_calculation tasks to quality-check — skipping.")
+        return
+
+    bucket = os.environ["S3_BUCKET"]
+    hook = _get_s3_hook()
+    required_columns = {"mol_weight", "log_p", "tpsa", "hba", "hbd"}
+
+    for entry in properties_tasks:
+        task_id = entry["task_id"]
+        s3_key = f"tasks/{task_id}/artifacts/properties.csv"
+
+        if not hook.check_for_key(key=s3_key, bucket_name=bucket):
+            raise FileNotFoundError(
+                f"Quality check failed: properties.csv not found in S3 for task {task_id} "
+                f"(dataset '{entry['dataset_id']}'): s3://{bucket}/{s3_key}"
+            )
+
+        raw = hook.read_key(key=s3_key, bucket_name=bucket).strip()
+
+        if not raw:
+            raise ValueError(
+                f"Quality check failed: properties.csv is empty for task {task_id} "
+                f"(dataset '{entry['dataset_id']}')"
+            )
+
+        reader = csv.DictReader(io.StringIO(raw))
+        found_columns = set(reader.fieldnames or [])
+        missing = required_columns - found_columns
+        if missing:
+            raise ValueError(
+                f"Quality check failed: properties.csv for task {task_id} "
+                f"(dataset '{entry['dataset_id']}') is missing columns: {sorted(missing)}. "
+                f"Found: {reader.fieldnames}"
+            )
+
+        rows = list(reader)
+        if not rows:
+            raise ValueError(
+                f"Quality check failed: properties.csv for task {task_id} "
+                f"(dataset '{entry['dataset_id']}') has a header but no data rows."
+            )
+
+        logger.info(
+            "Quality check passed for task %s (dataset '%s'): %d rows with properties.",
+            task_id,
+            entry["dataset_id"],
+            len(rows),
+        )
+
+
 with DAG(
-    dag_id="molecules_generation",
+    dag_id="cheminformatics_pipeline",
     schedule="@weekly",
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -507,7 +693,7 @@ with DAG(
             ),
         ),
     },
-    tags=["cheminformatics"],
+    tags=["cheminformatics", "molecules_generation", "properties_calculation"],
 ) as dag:
     t_start = EmptyOperator(task_id="start")
 
@@ -536,9 +722,24 @@ with DAG(
         python_callable=run_molecule_generation,
     )
 
-    t_quality_checks = PythonOperator(
-        task_id="quality_checks",
-        python_callable=quality_checks,
+    t_quality_checks_molecules = PythonOperator(
+        task_id="quality_checks_molecules",
+        python_callable=quality_checks_molecules,
+    )
+
+    t_create_properties_tasks = PythonOperator(
+        task_id="create_properties_calculation_tasks",
+        python_callable=create_properties_calculation_tasks,
+    )
+
+    t_run_properties = PythonOperator(
+        task_id="run_properties_calculation",
+        python_callable=run_properties_calculation,
+    )
+
+    t_quality_checks_properties = PythonOperator(
+        task_id="quality_checks_properties",
+        python_callable=quality_checks_properties,
     )
 
     t_finish = EmptyOperator(
@@ -553,6 +754,9 @@ with DAG(
         >> t_create_tasks
         >> t_register_artifacts
         >> t_run
-        >> t_quality_checks
+        >> t_quality_checks_molecules
+        >> t_create_properties_tasks
+        >> t_run_properties
+        >> t_quality_checks_properties
         >> t_finish
     )
