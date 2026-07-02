@@ -1,31 +1,13 @@
 version: "3.9"
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: dev
-      POSTGRES_PASSWORD: dev
-      POSTGRES_DB: tasks
-    ports:
-      - "5432:5432"
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-      - ./migrate.local.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dev -d tasks"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   minio:
     image: minio/minio:latest
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
     ports:
       - "9005:9000"   # S3 API
       - "9006:9001"   # Web console
@@ -42,17 +24,20 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
     volumes:
       - ./fixtures:/fixtures:ro
     entrypoint: >
       /bin/sh -c "
-        mc alias set local http://minio:9000 minioadmin minioadmin &&
-        mc mb --ignore-existing local/pipeline-results &&
-        mc cp /fixtures/ABC123_scaffolds.csv local/pipeline-results/inputs/ABC123_scaffolds.csv &&
-        mc cp /fixtures/ABC123_r_groups.csv local/pipeline-results/inputs/ABC123_r_groups.csv &&
+        mc alias set local http://minio:9000 \"$$S3_ACCESS_KEY\" \"$$S3_SECRET_KEY\" &&
+        mc mb --ignore-existing local/\"$$S3_BUCKET\" &&
+        mc cp /fixtures/ABC123_scaffolds.csv local/\"$$S3_BUCKET\"/inputs/ABC123_scaffolds.csv &&
+        mc cp /fixtures/ABC123_r_groups.csv local/\"$$S3_BUCKET\"/inputs/ABC123_r_groups.csv &&
         echo 'Bucket ready, ABC123 fixture loaded.'
       "
 
 volumes:
-  pg_data:
   minio_data:
