@@ -8,7 +8,6 @@ from typing import Any
 from rdkit import Chem
 from rdkit.Chem import Descriptors, rdMolDescriptors
 
-from .repository import TaskRepository
 from .utils import download_file_from_s3, file_exists_in_s3, upload_file_to_s3
 
 logger = logging.getLogger(__name__)
@@ -29,33 +28,29 @@ class PropertiesCalculationService:
             and Descriptors.MolLogP(mol) <= 5
             and rdMolDescriptors.CalcNumHBA(mol) <= 10
             and rdMolDescriptors.CalcNumHBD(mol) <= 5
-        )}
+        ),
+    }
 
-    def __init__(self, task, repo: TaskRepository, session) -> None:
-        self._task = task
-        self._repo = repo
-        self._session = session
-        self._smiles_column = self._task.params.get("smiles_column", "smiles")
+    def __init__(self, dataset_id: str, smiles_column: str = "smiles") -> None:
+        self._dataset_id = dataset_id
+        self._smiles_column = smiles_column
+        self._molecules_key = f"outputs/{dataset_id}/molecules.csv"
+        self._output_key = f"outputs/{dataset_id}/properties.csv"
 
-    def _validate_params(self) -> None:
-        params = self._task.params
-
-        if not params.get("molecules_artifact_id"):
-            raise ValueError("molecules_artifact_id is required.")
-
-        artifact = self._repo.get_artifact_by_id(params["molecules_artifact_id"])
-        if not file_exists_in_s3(artifact.s3_key):
-            raise ValueError(f"Molecules file not found in S3: {artifact.s3_key}")
+    def _validate_inputs(self) -> None:
+        if not file_exists_in_s3(self._molecules_key):
+            raise ValueError(
+                f"molecules.csv not found for dataset '{self._dataset_id}': "
+                f"{self._molecules_key}. Has the molecule generation stage run yet?"
+            )
 
     def _load_molecules(self) -> list[dict[str, str]]:
-        artifact = self._repo.get_artifact_by_id(self._task.params["molecules_artifact_id"])
-        raw = download_file_from_s3(artifact.s3_key)
-
+        raw = download_file_from_s3(self._molecules_key)
         reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
 
         if self._smiles_column not in (reader.fieldnames or []):
             raise ValueError(
-                f"SMILES column '{self._smiles_column}' not found in CSV. "
+                f"SMILES column '{self._smiles_column}' not found in {self._molecules_key}. "
                 f"Available columns: {reader.fieldnames}"
             )
 
@@ -85,13 +80,12 @@ class PropertiesCalculationService:
                 failed += 1
                 continue
 
-            # Exclude bool properties (e.g. lipinski_pass) from rounding
             props = {}
             for name, fn in self.PROPERTIES.items():
                 value = fn(mol)
                 props[name] = round(value, 4) if isinstance(value, float) else value
 
-            result.append({**row, **props})
+            result.append({"smiles": smi, **props})
 
         stats = {
             "total_input": len(rows),
@@ -101,34 +95,27 @@ class PropertiesCalculationService:
         logger.info(f"Properties calculation complete: {stats}")
         return result, stats
 
-    def _upload_results(self, rows: list[dict], stats: dict) -> None:
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-        csv_bytes = buf.getvalue().encode("utf-8")
-
-        csv_key = f"tasks/{self._task.id}/artifacts/properties.csv"
-        upload_file_to_s3(csv_bytes, csv_key, content_type="text/csv")
-        self._repo.save_molecules_file(
-            task=self._task,
-            s3_key=csv_key,
-            filename="properties.csv",
-            content_type="text/csv",
-            meta={"total_calculated": stats["total_calculated"]},
-        )
-
-    def run(self) -> None:
-        self._validate_params()
+    def run(self) -> dict:
+        self._validate_inputs()
         rows = self._load_molecules()
 
         if not rows:
-            raise ValueError("No valid molecules found in input file.")
+            raise ValueError(f"No valid molecules found in {self._molecules_key}.")
 
         result_rows, stats = self._calculate_properties(rows)
 
         if not result_rows:
-            raise ValueError("Properties calculation produced 0 results.")
+            raise ValueError(f"Properties calculation produced 0 results for dataset '{self._dataset_id}'.")
 
-        self._upload_results(result_rows, stats)
-        self._session.flush()
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(result_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(result_rows)
+        csv_bytes = buf.getvalue().encode("utf-8")
+
+        upload_file_to_s3(csv_bytes, self._output_key, content_type="text/csv")
+
+        logger.info(
+            f"Dataset '{self._dataset_id}': {stats['total_calculated']} molecules -> {self._output_key}"
+        )
+        return {**stats, "output_key": self._output_key}
