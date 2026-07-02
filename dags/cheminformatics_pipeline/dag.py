@@ -147,7 +147,7 @@ def discover_datasets(**context) -> None:
     context["ti"].xcom_push(key="datasets", value=datasets)
 
 
-def _run_worker(stage: str, dataset_id: str) -> None:
+def _run_worker(stage: str, dataset_id: str, extra_args: list[str] | None = None) -> None:
     result = subprocess.run(
         [
             "docker", "run", "--rm",
@@ -159,6 +159,7 @@ def _run_worker(stage: str, dataset_id: str) -> None:
             "-e", f"S3_REGION={os.environ.get('S3_REGION', 'us-east-1')}",
             "pipeline_worker",
             "python", "run.py", stage, "--dataset-id", dataset_id,
+            *(extra_args or []),
         ],
         capture_output=True,
         text=True,
@@ -302,6 +303,92 @@ def quality_checks_properties(**context) -> None:
         )
 
 
+def run_molecules_clustering(**context) -> None:
+    datasets: list = context["ti"].xcom_pull(task_ids="discover_datasets", key="datasets") or []
+    if not datasets:
+        logger.info("No datasets to process — skipping clustering.")
+        return
+
+    n_clusters = context["params"].get("n_clusters")
+    extra_args = ["--n-clusters", str(n_clusters)] if n_clusters else None
+
+    for entry in datasets:
+        _run_worker("cluster", entry["dataset_id"], extra_args=extra_args)
+
+
+def quality_checks_clusters(**context) -> None:
+    """
+    Post-clustering quality checks on each dataset's clusters.csv:
+    - File exists in S3
+    - File is non-empty
+    - CSV has the expected 'smiles' and 'cluster' columns
+    - Every molecule in molecules.csv has a matching cluster assignment
+    - More than one cluster was actually produced (unless there's only 1 molecule)
+    """
+    datasets: list = context["ti"].xcom_pull(task_ids="discover_datasets", key="datasets") or []
+    if not datasets:
+        logger.info("No datasets to quality-check — skipping.")
+        return
+
+    bucket = os.environ["S3_BUCKET"]
+    hook = _get_s3_hook()
+
+    for entry in datasets:
+        dataset_id = entry["dataset_id"]
+        s3_key = f"{OUTPUTS_PREFIX}{dataset_id}/clusters.csv"
+
+        if not hook.check_for_key(key=s3_key, bucket_name=bucket):
+            raise FileNotFoundError(
+                f"Quality check failed: clusters.csv not found in S3 for dataset "
+                f"'{dataset_id}': s3://{bucket}/{s3_key}"
+            )
+
+        raw = hook.read_key(key=s3_key, bucket_name=bucket).strip()
+        if not raw:
+            raise ValueError(f"Quality check failed: clusters.csv is empty for dataset '{dataset_id}'")
+
+        reader = csv.DictReader(io.StringIO(raw))
+        found_columns = set(reader.fieldnames or [])
+        missing = {"smiles", "cluster"} - found_columns
+        if missing:
+            raise ValueError(
+                f"Quality check failed: clusters.csv for dataset '{dataset_id}' is "
+                f"missing columns: {sorted(missing)}. Found: {reader.fieldnames}"
+            )
+
+        rows = list(reader)
+        if not rows:
+            raise ValueError(
+                f"Quality check failed: clusters.csv for dataset '{dataset_id}' has a "
+                f"header but no data rows."
+            )
+
+        molecules_raw = hook.read_key(
+            key=f"{OUTPUTS_PREFIX}{dataset_id}/molecules.csv", bucket_name=bucket
+        ).strip()
+        molecules_row_count = sum(1 for _ in csv.DictReader(io.StringIO(molecules_raw)))
+        if len(rows) != molecules_row_count:
+            raise ValueError(
+                f"Quality check failed: clusters.csv for dataset '{dataset_id}' has "
+                f"{len(rows)} rows but molecules.csv has {molecules_row_count} — "
+                f"every molecule should have a cluster assignment."
+            )
+
+        distinct_clusters = {row["cluster"] for row in rows}
+        if len(distinct_clusters) < 2 and len(rows) > 1:
+            raise ValueError(
+                f"Quality check failed: clusters.csv for dataset '{dataset_id}' has "
+                f"{len(rows)} molecules but only 1 cluster — clustering may not have run correctly."
+            )
+
+        logger.info(
+            "Quality check passed for dataset '%s': %d molecules across %d clusters.",
+            dataset_id,
+            len(rows),
+            len(distinct_clusters),
+        )
+
+
 with DAG(
     dag_id="cheminformatics_pipeline",
     schedule="@weekly",
@@ -331,6 +418,15 @@ with DAG(
                 "If True, reprocess dataset(s) even if outputs/<id>/molecules.csv "
                 "already exists. If False (default), already-processed datasets "
                 "are skipped."
+            ),
+        ),
+        "n_clusters": Param(
+            default=None,
+            type=["integer", "null"],
+            description=(
+                "Optional. Number of K-means clusters to use for the clustering stage. "
+                "If left empty, k is chosen automatically per-dataset via a "
+                "sqrt(n_molecules / 2) heuristic, clamped to [2, 20]."
             ),
         ),
     },
@@ -363,6 +459,16 @@ with DAG(
         python_callable=quality_checks_properties,
     )
 
+    t_run_clustering = PythonOperator(
+        task_id="run_molecules_clustering",
+        python_callable=run_molecules_clustering,
+    )
+
+    t_quality_checks_clusters = PythonOperator(
+        task_id="quality_checks_clusters",
+        python_callable=quality_checks_clusters,
+    )
+
     t_finish = EmptyOperator(
         task_id="finish",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
@@ -375,5 +481,7 @@ with DAG(
         >> t_quality_checks_molecules
         >> t_run_properties
         >> t_quality_checks_properties
+        >> t_run_clustering
+        >> t_quality_checks_clusters
         >> t_finish
     )
