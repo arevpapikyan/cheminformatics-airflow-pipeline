@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 import os
 
@@ -45,6 +43,6 @@ def upload_file_to_s3(
 ) -> str:
     bucket = bucket or os.environ["S3_BUCKET"]
     client = get_s3_client()
-    logger.info(f"Uploading {len(data)} bytes → s3://{bucket}/{s3_key}")
+    logger.info(f"Uploading {len(data)} bytes -> s3://{bucket}/{s3_key}")
     client.put_object(Bucket=bucket, Key=s3_key, Body=data, ContentType=content_type)
     return s3_key
