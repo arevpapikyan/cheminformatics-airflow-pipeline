@@ -170,6 +170,12 @@ def _run_worker(stage: str, dataset_id: str, extra_args: list[str] | None = None
             f"pipeline_worker ({stage}) failed for dataset '{dataset_id}':\n{result.stderr}"
         )
 
+    # capture_output swallows the container's stdout — without logging it here, anything
+    # the worker only logger.info()'d (e.g. the ChemProp accuracy/balanced-accuracy summary)
+    # would be computed but never actually visible anywhere in the Airflow task log.
+    if result.stdout:
+        logger.info("pipeline_worker (%s) output for dataset '%s':\n%s", stage, dataset_id, result.stdout)
+
     logger.info("pipeline_worker (%s) completed for dataset '%s'", stage, dataset_id)
 
 
@@ -389,6 +395,85 @@ def quality_checks_clusters(**context) -> None:
         )
 
 
+def run_chemprop_prediction(**context) -> None:
+    datasets: list = context["ti"].xcom_pull(task_ids="discover_datasets", key="datasets") or []
+    if not datasets:
+        logger.info("No datasets to process — skipping ChemProp prediction.")
+        return
+
+    epochs = context["params"].get("chemprop_epochs", 5)
+
+    for entry in datasets:
+        _run_worker("chemprop", entry["dataset_id"], extra_args=["--epochs", str(epochs)])
+
+
+def quality_checks_chemprop(**context) -> None:
+    """Post-ChemProp quality checks on each dataset's chemprop_predictions.csv."""
+    datasets: list = context["ti"].xcom_pull(task_ids="discover_datasets", key="datasets") or []
+    if not datasets:
+        logger.info("No datasets to quality-check — skipping.")
+        return
+
+    bucket = os.environ["S3_BUCKET"]
+    hook = _get_s3_hook()
+
+    for entry in datasets:
+        dataset_id = entry["dataset_id"]
+        s3_key = f"{OUTPUTS_PREFIX}{dataset_id}/chemprop_predictions.csv"
+
+        if not hook.check_for_key(key=s3_key, bucket_name=bucket):
+            raise FileNotFoundError(
+                f"Quality check failed: chemprop_predictions.csv not found in S3 for "
+                f"dataset '{dataset_id}': s3://{bucket}/{s3_key}"
+            )
+
+        raw = hook.read_key(key=s3_key, bucket_name=bucket).strip()
+        if not raw:
+            raise ValueError(
+                f"Quality check failed: chemprop_predictions.csv is empty for dataset '{dataset_id}'"
+            )
+
+        reader = csv.DictReader(io.StringIO(raw))
+        found_columns = set(reader.fieldnames or [])
+        if "smiles" not in found_columns:
+            raise ValueError(
+                f"Quality check failed: chemprop_predictions.csv for dataset '{dataset_id}' "
+                f"is missing the 'smiles' column. Found: {reader.fieldnames}"
+            )
+
+        predicted_columns = [c for c in found_columns if c.startswith("predicted_")]
+        if not predicted_columns:
+            raise ValueError(
+                f"Quality check failed: chemprop_predictions.csv for dataset '{dataset_id}' "
+                f"has no predicted_* columns. Found: {reader.fieldnames}"
+            )
+
+        rows = list(reader)
+        if not rows:
+            raise ValueError(
+                f"Quality check failed: chemprop_predictions.csv for dataset '{dataset_id}' "
+                f"has a header but no data rows."
+            )
+
+        properties_raw = hook.read_key(
+            key=f"{OUTPUTS_PREFIX}{dataset_id}/properties.csv", bucket_name=bucket
+        ).strip()
+        properties_row_count = sum(1 for _ in csv.DictReader(io.StringIO(properties_raw)))
+        if len(rows) != properties_row_count:
+            raise ValueError(
+                f"Quality check failed: chemprop_predictions.csv for dataset '{dataset_id}' "
+                f"has {len(rows)} rows but properties.csv has {properties_row_count} — "
+                f"every molecule should have a prediction."
+            )
+
+        logger.info(
+            "Quality check passed for dataset '%s': %d molecules, %d predicted properties.",
+            dataset_id,
+            len(rows),
+            len(predicted_columns),
+        )
+
+
 with DAG(
     dag_id="cheminformatics_pipeline",
     schedule="@weekly",
@@ -429,8 +514,17 @@ with DAG(
                 "sqrt(n_molecules / 2) heuristic, clamped to [2, 20]."
             ),
         ),
+        "chemprop_epochs": Param(
+            default=5,
+            type="integer",
+            description=(
+                "Training epochs for the ChemProp stage. Kept low by default so the "
+                "stage runs quickly; increase for a more meaningful model on larger "
+                "datasets."
+            ),
+        ),
     },
-    tags=["cheminformatics", "molecules_generation", "properties_calculation"],
+    tags=["cheminformatics", "molecules_generation", "properties_calculation", "clustering", "chemprop"],
 ) as dag:
     t_start = EmptyOperator(task_id="start")
 
@@ -469,6 +563,16 @@ with DAG(
         python_callable=quality_checks_clusters,
     )
 
+    t_run_chemprop = PythonOperator(
+        task_id="run_chemprop_prediction",
+        python_callable=run_chemprop_prediction,
+    )
+
+    t_quality_checks_chemprop = PythonOperator(
+        task_id="quality_checks_chemprop",
+        python_callable=quality_checks_chemprop,
+    )
+
     t_finish = EmptyOperator(
         task_id="finish",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
@@ -483,5 +587,7 @@ with DAG(
         >> t_quality_checks_properties
         >> t_run_clustering
         >> t_quality_checks_clusters
+        >> t_run_chemprop
+        >> t_quality_checks_chemprop
         >> t_finish
     )

@@ -4,6 +4,7 @@ import sys
 
 from dotenv import load_dotenv
 
+from gen.chemprop_prediction_service import ChemPropPredictionService
 from gen.decorators import timer
 from gen.molecules_clustering_service import MoleculesClusteringService
 from gen.molecules_generation_service import MoleculeGenerationService
@@ -27,6 +28,11 @@ def run_properties(dataset_id: str) -> None:
 @timer
 def run_cluster(dataset_id: str, n_clusters: int | None) -> None:
     MoleculesClusteringService(dataset_id, n_clusters=n_clusters).run()
+
+
+@timer
+def run_chemprop(dataset_id: str, epochs: int) -> None:
+    ChemPropPredictionService(dataset_id, epochs=epochs).run()
 
 
 def main() -> None:
@@ -54,6 +60,19 @@ def main() -> None:
         help="Optional. If omitted, k is chosen automatically via a sqrt(n/2) heuristic.",
     )
 
+    chemprop_parser = subparsers.add_parser(
+        "chemprop",
+        help="Train a multitask ChemProp model on a dataset's properties.csv and predict back on it.",
+    )
+    chemprop_parser.add_argument("--dataset-id", required=True)
+    chemprop_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Training epochs. Kept low by default so the stage runs quickly in a pipeline "
+        "context; increase for a more meaningful model.",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -63,6 +82,8 @@ def main() -> None:
             run_properties(args.dataset_id)
         elif args.stage == "cluster":
             run_cluster(args.dataset_id, args.n_clusters)
+        elif args.stage == "chemprop":
+            run_chemprop(args.dataset_id, args.epochs)
     except Exception as e:
         logging.exception(e)
         raise

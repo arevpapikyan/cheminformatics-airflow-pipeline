@@ -34,13 +34,18 @@ services:
       /bin/sh -c "
         mc alias set local http://minio:9000 \"$$S3_ACCESS_KEY\" \"$$S3_SECRET_KEY\" &&
         mc mb --ignore-existing local/\"$$S3_BUCKET\" &&
-        mc cp /fixtures/ABC123_scaffolds.csv local/\"$$S3_BUCKET\"/inputs/ABC123_scaffolds.csv &&
-        mc cp /fixtures/ABC123_r_groups.csv local/\"$$S3_BUCKET\"/inputs/ABC123_r_groups.csv &&
-        echo 'Bucket ready, ABC123 fixture loaded.'
+        for f in /fixtures/*_scaffolds.csv /fixtures/*_r_groups.csv; do
+          if [ -f \"$$f\" ]; then
+            mc cp \"$$f\" local/\"$$S3_BUCKET\"/inputs/\"$$(basename $$f)\" &&
+            echo \"Loaded $$(basename $$f)\";
+          fi
+        done &&
+        echo 'Bucket ready, fixtures loaded.'
       "
 
 volumes:
   minio_data:
+    name: pipeline_minio_data
 
 networks:
   default:
