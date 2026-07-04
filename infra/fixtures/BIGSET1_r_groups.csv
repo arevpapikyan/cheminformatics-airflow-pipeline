@@ -1,0 +1,12 @@
+R1,R2
+[*:1]C,[*:2]C
+[*:1]CC,[*:2]CC
+[*:1]CCC,[*:2]CCC
+[*:1]CCCC,[*:2]CCCC
+[*:1]Cl,[*:2]Cl
+[*:1]F,[*:2]Br
+[*:1]O,[*:2]C#N
+[*:1]N,[*:2]C(F)(F)F
+[*:1]CCCCCCCCCCCC,[*:2]c1ccccc1
+[*:1]C(O)CO,[*:2]C(O)CO
+[*:1]C(N)CN,[*:2]C(N)CN
