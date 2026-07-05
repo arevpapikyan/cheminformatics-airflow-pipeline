@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 from gen.chemprop_prediction_service import ChemPropPredictionService
 from gen.decorators import timer
+from gen.faerun_graph_service import FaerunGraphService
 from gen.molecules_clustering_service import MoleculesClusteringService
 from gen.molecules_generation_service import MoleculeGenerationService
 from gen.properties_calculation_service import PropertiesCalculationService
@@ -33,6 +34,11 @@ def run_cluster(dataset_id: str, n_clusters: int | None) -> None:
 @timer
 def run_chemprop(dataset_id: str, epochs: int) -> None:
     ChemPropPredictionService(dataset_id, epochs=epochs).run()
+
+
+@timer
+def run_faerun(dataset_id: str, fingerprint_type: str) -> None:
+    FaerunGraphService(dataset_id, fingerprint_type=fingerprint_type).run()
 
 
 def main() -> None:
@@ -73,6 +79,16 @@ def main() -> None:
         "context; increase for a more meaningful model.",
     )
 
+    faerun_parser = subparsers.add_parser(
+        "faerun", help="Build an interactive TMAP/faerun chemical-space graph for a dataset."
+    )
+    faerun_parser.add_argument("--dataset-id", required=True)
+    faerun_parser.add_argument(
+        "--fingerprint-type",
+        default="morgan",
+        help="Fingerprint type passed to tmap's fingerprints_from_smiles (default: morgan).",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -84,6 +100,8 @@ def main() -> None:
             run_cluster(args.dataset_id, args.n_clusters)
         elif args.stage == "chemprop":
             run_chemprop(args.dataset_id, args.epochs)
+        elif args.stage == "faerun":
+            run_faerun(args.dataset_id, args.fingerprint_type)
     except Exception as e:
         logging.exception(e)
         raise

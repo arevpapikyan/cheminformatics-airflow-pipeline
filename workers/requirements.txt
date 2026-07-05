@@ -2,6 +2,9 @@ rdkit>=2023.9.1
 scikit-learn>=1.4.0
 numpy>=1.26.0
 chemprop>=2.0.0
+tmap2>=0.2.0
+faerun>=0.4.0
+matplotlib<3.11
 boto3>=1.34.0
 python-dotenv>=1.0.0
 ruff>=0.4.0

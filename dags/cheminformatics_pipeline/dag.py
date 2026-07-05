@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import zipfile
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -474,6 +475,54 @@ def quality_checks_chemprop(**context) -> None:
         )
 
 
+def run_faerun_graph(**context) -> None:
+    datasets: list = context["ti"].xcom_pull(task_ids="discover_datasets", key="datasets") or []
+    if not datasets:
+        logger.info("No datasets to process — skipping faerun graph build.")
+        return
+
+    for entry in datasets:
+        _run_worker("faerun", entry["dataset_id"])
+
+
+def quality_checks_faerun(**context) -> None:
+    """
+    Post-faerun quality checks: confirms tmap_graph.zip exists, is non-empty, and
+    actually contains an html file (not just a header-only/corrupt archive).
+    """
+    datasets: list = context["ti"].xcom_pull(task_ids="discover_datasets", key="datasets") or []
+    if not datasets:
+        logger.info("No datasets to quality-check — skipping.")
+        return
+
+    bucket = os.environ["S3_BUCKET"]
+    hook = _get_s3_hook()
+
+    for entry in datasets:
+        dataset_id = entry["dataset_id"]
+        s3_key = f"{OUTPUTS_PREFIX}{dataset_id}/tmap_graph.zip"
+
+        if not hook.check_for_key(key=s3_key, bucket_name=bucket):
+            raise FileNotFoundError(
+                f"Quality check failed: tmap_graph.zip not found in S3 for dataset "
+                f"'{dataset_id}': s3://{bucket}/{s3_key}"
+            )
+
+        raw = hook.get_key(key=s3_key, bucket_name=bucket).get()["Body"].read()
+        if not raw:
+            raise ValueError(f"Quality check failed: tmap_graph.zip is empty for dataset '{dataset_id}'")
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            if not any(name.endswith(".html") for name in names):
+                raise ValueError(
+                    f"Quality check failed: tmap_graph.zip for dataset '{dataset_id}' "
+                    f"contains no .html file. Found: {names}"
+                )
+
+        logger.info("Quality check passed for dataset '%s': tmap_graph.zip contains %s", dataset_id, names)
+
+
 with DAG(
     dag_id="cheminformatics_pipeline",
     schedule="@weekly",
@@ -524,7 +573,7 @@ with DAG(
             ),
         ),
     },
-    tags=["cheminformatics", "molecules_generation", "properties_calculation", "clustering", "chemprop"],
+    tags=["cheminformatics", "molecules_generation", "properties_calculation", "clustering", "chemprop", "faerun"],
 ) as dag:
     t_start = EmptyOperator(task_id="start")
 
@@ -573,6 +622,16 @@ with DAG(
         python_callable=quality_checks_chemprop,
     )
 
+    t_run_faerun = PythonOperator(
+        task_id="run_faerun_graph",
+        python_callable=run_faerun_graph,
+    )
+
+    t_quality_checks_faerun = PythonOperator(
+        task_id="quality_checks_faerun",
+        python_callable=quality_checks_faerun,
+    )
+
     t_finish = EmptyOperator(
         task_id="finish",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
@@ -589,5 +648,7 @@ with DAG(
         >> t_quality_checks_clusters
         >> t_run_chemprop
         >> t_quality_checks_chemprop
+        >> t_run_faerun
+        >> t_quality_checks_faerun
         >> t_finish
     )
