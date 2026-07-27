@@ -1,0 +1,6 @@
+smiles
+[*:1]c1ccc([*:2])cc1
+[*:1]c1ccc([*:2])nc1
+[*:1]C1CCC([*:2])CC1
+[*:1]c1ccc(-c2ccccc2[*:2])cc1
+[*:1]c1cc([*:2])ncn1

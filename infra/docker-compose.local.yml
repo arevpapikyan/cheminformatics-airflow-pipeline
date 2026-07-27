@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "9005:9000"   # S3 API
+      - "9006:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    volumes:
+      - ./fixtures:/fixtures:ro
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 \"$$S3_ACCESS_KEY\" \"$$S3_SECRET_KEY\" &&
+        mc mb --ignore-existing local/\"$$S3_BUCKET\" &&
+        for f in /fixtures/*_scaffolds.csv /fixtures/*_r_groups.csv; do
+          if [ -f \"$$f\" ]; then
+            mc cp \"$$f\" local/\"$$S3_BUCKET\"/inputs/\"$$(basename $$f)\" &&
+            echo \"Loaded $$(basename $$f)\";
+          fi
+        done &&
+        echo 'Bucket ready, fixtures loaded.'
+      "
+
+volumes:
+  minio_data:
+    name: pipeline_minio_data
+
+networks:
+  default:
+    name: pipeline_infra

@@ -1,0 +1,30 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["venv/"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "B904", # raise from inside except — not always needed
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true  # for rdkit, boto3 which have no stubs
+exclude = ["venv/"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["gen"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

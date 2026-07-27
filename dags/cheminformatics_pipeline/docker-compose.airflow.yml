@@ -1,0 +1,90 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.0.1
+  user: "0:0"
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USERNAME}:${AIRFLOW_ADMIN_PASSWORD}"
+    S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY}
+    S3_BUCKET: ${S3_BUCKET}
+    S3_REGION: ${S3_REGION}
+    AIRFLOW_CONN_AWS_S3: ${AIRFLOW_CONN_AWS_S3}
+    AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME}
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL}
+  volumes:
+    - ../../dags:/opt/airflow/dags:ro
+    - airflow_home:/opt/airflow
+    - /var/run/docker.sock:/var/run/docker.sock
+  networks:
+    - infra
+
+services:
+  airflow_db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    ports:
+      - "5434:5432"
+    volumes:
+      - airflow_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - infra
+
+  airflow_init:
+    <<: *airflow-common
+    restart: on-failure
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        python -c "
+        import json, os
+        u = os.environ['AIRFLOW_ADMIN_USERNAME']
+        p = os.environ['AIRFLOW_ADMIN_PASSWORD']
+        path = '/opt/airflow/simple_auth_manager_passwords.json.generated'
+        json.dump({u: p}, open(path, 'w'))
+        print(open(path).read())
+        "
+
+  airflow:
+    <<: *airflow-common
+    command: standalone
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+      airflow_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  airflow_pg_data:
+  airflow_home:
+
+networks:
+  infra:
+    name: pipeline_infra
+    external: true
